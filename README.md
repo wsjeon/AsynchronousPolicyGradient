@@ -1,4 +1,4 @@
-# Toy Example for Policy Gradient Method with Asynchronous Reinforcement Learning
+# Toy Example for Asynchronous Reinforcement Learning
 - The code without asynchronous reinforcement learning is given in [this repository](https://github.com/wsjeon/CartPolePolicyGradient).
 
 ## Dependencies
