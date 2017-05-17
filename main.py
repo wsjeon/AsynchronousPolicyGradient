@@ -169,7 +169,9 @@ if FLAGS.job_name == 'ps':
   server.join() # See the issue (https://github.com/tensorflow/tensorflow/issues/4713).
 
 elif FLAGS.job_name == 'worker':
-  with tf.Session(server.target) as sess:
+  config = tf.ConfigProto()
+  config.gpu_options.per_process_gpu_memory_fraction = 0.3
+  with tf.Session(server.target, config=config) as sess:
 
     # Summary writer
     summary_writer = tf.summary.FileWriter(FLAGS.LOGDIR, sess.graph)
@@ -196,7 +198,6 @@ elif FLAGS.job_name == 'worker':
   
       # Agent-environment interaction
       while True:
-        env.render()
         action = act(observation)
         experience_buffer[0].append(observation)
         experience_buffer[1].append(action)
@@ -214,8 +215,8 @@ elif FLAGS.job_name == 'worker':
   
       # Log and tf summary.
       if episode % 10 == 0:
-        print('episode: {0}\t|score: {1}\t|speed: {2} episodes/sec'.format(
-          episode, score, 10/(time.time()-start_time)))
+        print('worker{0}\t|episode: {1}\t|score: {2}\t|speed: {3} episodes/sec'.format(
+          FLAGS.task_index, episode, score, 10/(time.time()-start_time)))
         summary_str = sess.run(summary_op, {score_: score})
         summary_writer.add_summary(summary_str, episode)
         summary_writer.flush()

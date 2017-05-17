@@ -6,7 +6,7 @@
 # Wonseok Jeon at KAIST
 # wonsjeon@kaist.ac.kr
 
-NUM_WORKERS=1
+NUM_WORKERS=2
 
 python main.py --job_name 'ps' --task_index 0 &
 PID[0]=$!
