@@ -22,7 +22,7 @@ from tensorflow.contrib.slim import fully_connected as fc
 flags = tf.app.flags
 flags.DEFINE_float('GAMMA', 0.98, 'discount factor')
 flags.DEFINE_float('LEARNING_RATE', 0.001, 'learning rate')
-flags.DEFINE_integer('NUM_EPISODES', 2000, 'maximum episodes for training')
+flags.DEFINE_integer('NUM_EPISODES', 400, 'maximum episodes for training')
 flags.DEFINE_string('LOGDIR', './tmp', 'log directory')
 flags.DEFINE_string('job_name', 'worker', 'job name: worker or ps (parameter server)')
 flags.DEFINE_integer('task_index', 0, 'task index of server')
@@ -162,7 +162,8 @@ server = tf.train.Server(cluster, job_name=FLAGS.job_name, task_index=FLAGS.task
 
 if FLAGS.job_name == 'ps':
   env.close()
-  server.join()
+  server.join() # See the issue (https://github.com/tensorflow/tensorflow/issues/4713).
+
 elif FLAGS.job_name == 'worker':
   with tf.Session(server.target) as sess:
 

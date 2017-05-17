@@ -1,8 +1,11 @@
 #!/bin/bash
-for job_name in 'ps' 'worker'
-do
-for task_index in 0
-do
-	python main.py --job_name $job_name --task_index $task_index &
-done
-done
+# Asynchronous learning using shell script.
+#
+# Kill 'ps' job after training. 
+#
+# Wonseok Jeon at KAIST
+# wonsjeon@kaist.ac.kr
+python main.py --job_name 'ps' --task_index 0 &
+PID=$!
+python main.py --job_name 'worker' --task_index 0
+kill $PID
