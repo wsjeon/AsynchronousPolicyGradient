@@ -25,14 +25,18 @@ flags.DEFINE_float('LEARNING_RATE', 0.001, 'learning rate')
 flags.DEFINE_integer('NUM_EPISODES', 400, 'maximum episodes for training')
 flags.DEFINE_string('LOGDIR', './tmp', 'log directory')
 flags.DEFINE_string('job_name', 'worker', 'job name: worker or ps (parameter server)')
+flags.DEFINE_integer('NUM_WORKERS', 1, 'number of workers')
 flags.DEFINE_integer('task_index', 0, 'task index of server')
 FLAGS = flags.FLAGS
 
+# Cluster
+worker = ['localhost:2220']
+ps = ['localhost:{}'.format(2221+i) for i in range(FLAGS.NUM_WORKERS)]
 cluster = tf.train.ClusterSpec({
-  'worker': ['localhost:2222'],
-  'ps': ['localhost:2223']})
+  'worker': worker,
+  'ps': ps})
 
-# Environemt
+# Environment: Each task will run environments indepedently.
 env = gym.make('CartPole-v0')
 observation_size = env.observation_space.shape[0]
 action_size = env.action_space.n
@@ -80,41 +84,43 @@ with tf.variable_scope('shared_memory'):
     # Global counter
     counter_op = global_step_counter.assign(global_step_counter + 1)
 
-# Worker
-with tf.variable_scope('worker'):
-  with tf.device('/job:worker/task:0/gpu:0'):
-
-    # Local network and parameters
-    observation_ = tf.placeholder(tf.float32, [None, observation_size], name='observation')
-    policy = _net(observation_)
-    local_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='worker')
-
-    # Assign operator: global shared parameters -> local parameters
-    assign_op = tf.group(*[
-      local_param.assign(global_param)
-      for local_param, global_param in zip(local_params, global_params)],
-      name='synchronizer')  
-
-    # Loss
-    action_ = tf.placeholder(tf.int32, [None], name='action')
-    advantage_ = tf.placeholder(tf.float32, name='advantage')
-
-    def _loss():
-      log_policy = tf.log(policy)
-      one_hot_action = tf.one_hot(action_, action_size)
-      return -tf.multiply(
-          tf.reduce_sum(log_policy*one_hot_action),
-          advantage_,
-          name='loss')
-    loss = _loss()
-
-    # Gradients w.r.t. local parameters
-    grads = tf.gradients(loss, local_params)
-
-    # Apply gradients to global shared parameters 
-    grads_and_vars = zip(grads, global_params)
-    train_op = optimizer.apply_gradients(grads_and_vars, name='grad_applier')
-     
+# Workers
+for i in range(FLAGS.NUM_WORKERS):
+  scope = 'worker%d'%i
+  with tf.variable_scope(scope):
+    with tf.device('/job:worker/task:%d/gpu:0'%i):
+  
+      # Local network and parameters
+      observation_ = tf.placeholder(tf.float32, [None, observation_size], name='observation')
+      policy = _net(observation_)
+      local_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope)
+  
+      # Assign operator: global shared parameters -> local parameters
+      assign_op = tf.group(*[
+        local_param.assign(global_param)
+        for local_param, global_param in zip(local_params, global_params)],
+        name='synchronizer')  
+  
+      # Loss
+      action_ = tf.placeholder(tf.int32, [None], name='action')
+      advantage_ = tf.placeholder(tf.float32, name='advantage')
+  
+      def _loss():
+        log_policy = tf.log(policy)
+        one_hot_action = tf.one_hot(action_, action_size)
+        return -tf.multiply(
+            tf.reduce_sum(log_policy*one_hot_action),
+            advantage_,
+            name='loss')
+      loss = _loss()
+  
+      # Gradients w.r.t. local parameters
+      grads = tf.gradients(loss, local_params)
+  
+      # Apply gradients to global shared parameters 
+      grads_and_vars = zip(grads, global_params)
+      train_op = optimizer.apply_gradients(grads_and_vars, name='grad_applier')
+       
 # Additional modules and operators
 def act(observation):
   """Choose action based on observation and policy.
@@ -125,7 +131,6 @@ def act(observation):
   Returns:
     action: Action randomly chosen by using current policy.
   """
-  sess = tf.get_default_session()
   current_policy = sess.run(policy, {observation_: [observation]})
   action = np.random.choice(action_size, p=current_policy[0])
   return action
@@ -145,7 +150,6 @@ def update(experience_buffer, returns):
   Returns:
     returns: list of discounted sums of rewards
   """
-  sess = tf.get_default_session()
   rewards = np.array(experience_buffer[2])
   discount_rewards = rewards * (FLAGS.GAMMA ** np.arange(len(rewards)))
   current_return = discount_rewards.sum()
@@ -192,6 +196,7 @@ elif FLAGS.job_name == 'worker':
   
       # Agent-environment interaction
       while True:
+        env.render()
         action = act(observation)
         experience_buffer[0].append(observation)
         experience_buffer[1].append(action)
