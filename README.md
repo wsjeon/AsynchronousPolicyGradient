@@ -7,4 +7,8 @@
 - OpenAI Gym
 
 ## How to run
-- `python main.py`
+- `bash run.sh`
+
+## Current state
+- Single worker is defined.
+- Debugging is done by checking the graph shown in TensorBoard. 
