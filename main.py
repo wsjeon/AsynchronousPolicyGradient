@@ -4,13 +4,17 @@
 #
 #   https://gym.openai.com/evaluations/eval_PqFieTTRCCwtOx96e8KMw
 #
-# where algorithm is implemented based on numpy. I try to implement 
-# the same algorithm using in-graph replication and asynchronous learning 
-# provided by TensorFlow.
+# where algorithm is implemented based on numpy.
+# 
+# This code is implemented by using Distributed TensorFlow.
+#
+# Wonseok Jeon at KAIST
+# wonsjeon@kaist.ac.kr
 import tensorflow as tf
 import numpy as np
 import gym
 import time
+from multiprocessing import Process
 from tensorflow.contrib import slim
 from tensorflow.contrib.slim import fully_connected as fc
 
@@ -19,10 +23,14 @@ flags = tf.app.flags
 flags.DEFINE_float('GAMMA', 0.98, 'discount factor')
 flags.DEFINE_float('LEARNING_RATE', 0.001, 'learning rate')
 flags.DEFINE_integer('NUM_EPISODES', 2000, 'maximum episodes for training')
-flags.DEFINE_boolean('MONITOR', False, 'monitor training frames or not')
 flags.DEFINE_string('LOGDIR', './tmp', 'log directory')
-flags.DEFINE_string('MONITORDIR', './monitor', 'directory for monitoring')
+flags.DEFINE_string('job_name', 'worker', 'job name: worker or ps (parameter server)')
+flags.DEFINE_integer('task_index', 0, 'task index of server')
 FLAGS = flags.FLAGS
+
+cluster = tf.train.ClusterSpec({
+  'worker': ['localhost:2222'],
+  'ps': ['localhost:2223']})
 
 # Environemt
 env = gym.make('CartPole-v0')
@@ -30,8 +38,6 @@ observation_size = env.observation_space.shape[0]
 action_size = env.action_space.n
 
 # Neural network for policy approximation
-observation_ = tf.placeholder(tf.float32, [None, observation_size])
-
 def _net(net, hidden_layer_size=16):
   net = fc(net, hidden_layer_size, activation_fn=tf.nn.sigmoid, scope='fc0',
       weights_initializer =\
@@ -40,29 +46,76 @@ def _net(net, hidden_layer_size=16):
       weights_initializer =\
           tf.random_normal_initializer(stddev=1/np.sqrt(hidden_layer_size)))
   return net
-policy = _net(observation_)
 
-# Loss
-action_ = tf.placeholder(tf.int32, [None])
-advantage_ = tf.placeholder(tf.float32)
+# Shared memory
+with tf.variable_scope('shared_memory'):
+  """Global shared memory
+  Note: The scope 'shared_memory' is to share the followings:
+    1) parameters
+    2) step counter
+    3) optimizer
+    4) summary
+  """
+  with tf.device('/job:ps/task:0/cpu:0'):
 
-def _loss():
-  log_policy = tf.log(policy)
-  one_hot_action = tf.one_hot(action_, action_size)
-  return -tf.reduce_sum(log_policy*one_hot_action) * advantage_
-loss = _loss()
+    # Global shared parameters 
+    observation_ = tf.placeholder(tf.float32, [None, observation_size], name='observation')
+    policy = _net(observation_)
+    global_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='shared_memory')
 
-# Optimizer and train operator
-optimizer = tf.train.GradientDescentOptimizer(FLAGS.LEARNING_RATE)
-train_op = optimizer.minimize(loss)
-  
-# Summary
-score_ = tf.placeholder(tf.float32)
-tf.summary.scalar('score', score_)
-summary_op = tf.summary.merge_all()
-summary_writer = tf.summary.FileWriter(FLAGS.LOGDIR)
+    # Global step counter
+    global_step_counter = tf.get_variable('global_step_counter', [],
+        initializer = tf.constant_initializer(),
+        trainable = False,
+        dtype = tf.int32)
 
-# Additional modules and operators for training
+    # Global shared optimizer ???
+    optimizer = tf.train.GradientDescentOptimizer(FLAGS.LEARNING_RATE)
+
+    # Summary
+    score_ = tf.placeholder(tf.float32, name='score_')
+    tf.summary.scalar('score', score_)
+    summary_op = tf.summary.merge_all()
+    
+    # Global counter
+    counter_op = global_step_counter.assign(global_step_counter + 1)
+
+# Worker
+with tf.variable_scope('worker'):
+  with tf.device('/job:worker/task:0/gpu:0'):
+
+    # Local network and parameters
+    observation_ = tf.placeholder(tf.float32, [None, observation_size], name='observation')
+    policy = _net(observation_)
+    local_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='worker')
+
+    # Assign operator: global shared parameters -> local parameters
+    assign_op = tf.group(*[
+      local_param.assign(global_param)
+      for local_param, global_param in zip(local_params, global_params)],
+      name='synchronizer')  
+
+    # Loss
+    action_ = tf.placeholder(tf.int32, [None], name='action')
+    advantage_ = tf.placeholder(tf.float32, name='advantage')
+
+    def _loss():
+      log_policy = tf.log(policy)
+      one_hot_action = tf.one_hot(action_, action_size)
+      return -tf.multiply(
+          tf.reduce_sum(log_policy*one_hot_action),
+          advantage_,
+          name='loss')
+    loss = _loss()
+
+    # Gradients w.r.t. local parameters
+    grads = tf.gradients(loss, local_params)
+
+    # Apply gradients to global shared parameters 
+    grads_and_vars = zip(grads, global_params)
+    train_op = optimizer.apply_gradients(grads_and_vars, name='grad_applier')
+     
+# Additional modules and operators
 def act(observation):
   """Choose action based on observation and policy.
 
@@ -72,6 +125,7 @@ def act(observation):
   Returns:
     action: Action randomly chosen by using current policy.
   """
+  sess = tf.get_default_session()
   current_policy = sess.run(policy, {observation_: [observation]})
   action = np.random.choice(action_size, p=current_policy[0])
   return action
@@ -91,6 +145,7 @@ def update(experience_buffer, returns):
   Returns:
     returns: list of discounted sums of rewards
   """
+  sess = tf.get_default_session()
   rewards = np.array(experience_buffer[2])
   discount_rewards = rewards * (FLAGS.GAMMA ** np.arange(len(rewards)))
   current_return = discount_rewards.sum()
@@ -102,56 +157,65 @@ def update(experience_buffer, returns):
                       advantage_: current_return - baseline}) 
   return returns
 
-global_step = tf.get_variable('global_step', [],
-    initializer = tf.constant_initializer(0),
-    trainable = False,
-    dtype = tf.int32)
+# Define task.
+server = tf.train.Server(cluster, job_name=FLAGS.job_name, task_index=FLAGS.task_index)
 
-counter_op = global_step.assign(global_step + 1)
+if FLAGS.job_name == 'ps':
+  env.close()
+  server.join()
+elif FLAGS.job_name == 'worker':
+  with tf.Session(server.target) as sess:
 
-# Training
-with tf.Session() as sess:
-  returns = [] # List to store returns of the last 100 episodes. 
-  sess.run(tf.global_variables_initializer())
-
-  # Monitor environment.
-  if FLAGS.MONITOR:
-    env.monitor.start(FLAGS.MONITORDIR, force = True)
-
-  start_time = time.time() # To check learning time.
-
-  # Training loop
-  while True:
-
-    # Intialization of episode. 
-    timestep = 0; score = 0.0; experience_buffer = [[], [], []]
-    episode = sess.run(global_step)
-    observation = env.reset()
-
-    # Agent-environment interaction
-    while True:
-      action = act(observation)
-      experience_buffer[0].append(observation)
-      experience_buffer[1].append(action)
-      observation, reward, done, _ = env.step(action)
-      experience_buffer[2].append(reward)
-  
-      timestep += 1; score += reward
-      
-      if done or timestep >= env.spec.timestep_limit:
-        break
+    # Summary writer
+    summary_writer = tf.summary.FileWriter(FLAGS.LOGDIR, sess.graph)
     
-    # Update neural network.
-    returns = update(experience_buffer, returns)
-    sess.run(counter_op)
+    # Variable initialization
+    sess.run(tf.global_variables_initializer())
 
-    # Log and tf summary.
-    if episode % 10 == 0:
-      print('episode: {0}\t|score: {1}\t|speed: {2} episodes/sec'.format(
-        episode, score, (episode+1)/(time.time()-start_time)))
-      summary_str = sess.run(summary_op, {score_: score})
-      summary_writer.add_summary(summary_str, episode)
-      summary_writer.flush()
+    # List to stre returns of the last 100 episodes
+    returns = []
 
-    if episode + 1 == FLAGS.NUM_EPISODES:
-      break
+    # To check learning speed
+    start_time = time.time()
+  
+    # Training loop
+    while True:
+      
+      # Global shared parameter -> local parameters
+      sess.run(assign_op)
+  
+      # Intialization of episode. 
+      timestep = 0; score = 0.0; experience_buffer = [[], [], []]
+      episode = sess.run(global_step_counter)
+      observation = env.reset()
+  
+      # Agent-environment interaction
+      while True:
+        action = act(observation)
+        experience_buffer[0].append(observation)
+        experience_buffer[1].append(action)
+        observation, reward, done, _ = env.step(action)
+        experience_buffer[2].append(reward)
+    
+        timestep += 1; score += reward
+        
+        if done or timestep >= env.spec.timestep_limit:
+          break
+      
+      # Update neural network.
+      returns = update(experience_buffer, returns)
+      sess.run(counter_op)
+  
+      # Log and tf summary.
+      if episode % 10 == 0:
+        print('episode: {0}\t|score: {1}\t|speed: {2} episodes/sec'.format(
+          episode, score, 10/(time.time()-start_time)))
+        summary_str = sess.run(summary_op, {score_: score})
+        summary_writer.add_summary(summary_str, episode)
+        summary_writer.flush()
+        start_time = time.time()
+  
+      if episode + 1 == FLAGS.NUM_EPISODES:
+        break
+
+  env.close()
